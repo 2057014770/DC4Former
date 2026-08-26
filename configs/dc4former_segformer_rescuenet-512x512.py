@@ -18,13 +18,12 @@ model = dict(
         depths=depths,
         drop_path_rate=0.15,
 
-        # TGRS-oriented Strong-C4 + constrained lightweight ESAF.
         c4_conv=True,
         c4_attention=True,
         c4_downsample=True,
-        fusion_type='cl_esaf',      # use 'mean' for the clean Strong-C4 ablation
-        fusion_alpha_max=0.25,      # adaptive correction is capped; mean fusion dominates
-        fusion_alpha_init=-2.0,     # starts close to mean fusion
+        fusion_type='cl_esaf',
+        fusion_alpha_max=0.25,
+        fusion_alpha_init=-2.0,
         fusion_temp_init=2.0,
 
         init_cfg=dict(type='Pretrained', checkpoint=pretrained),

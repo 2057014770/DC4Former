@@ -14,9 +14,6 @@ from mmengine.runner import CheckpointLoader
 from mmengine.logging import print_log
 
 
-# ==========================================================
-# Basic utilities
-# ==========================================================
 def drop_path(x, drop_prob: float = 0., training: bool = False, scale_by_keep: bool = True):
     if drop_prob == 0. or not training:
         return x
@@ -41,16 +38,8 @@ class DropPath(nn.Module):
         return f'drop_prob={round(self.drop_prob, 3):0.3f}'
 
 
-# ==========================================================
-# Strong C4 spatial operators
-# ==========================================================
 class C4SymConv2d(nn.Conv2d):
-    """C4 weight-symmetrized Conv2d for stride-1 spatial convolutions.
-
-    This layer is used for CPE and IRB depthwise convolutions. It averages the
-    four rotated kernels and performs a single convolution. Therefore it adds no
-    learnable parameters and keeps the extra compute low for stride-1 operators.
-    """
+    """Weight-symmetrized convolution for stride-1 spatial operators."""
 
     def __init__(self, *args, group_average: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
@@ -76,16 +65,7 @@ class C4SymConv2d(nn.Conv2d):
 
 
 class C4FeatureSymConv2d(nn.Conv2d):
-    """C4 feature-rotation Conv2d for strided/downsampling layers.
-
-    For stride>1, rotating kernels is not equivalent to rotating features before
-    downsampling. Therefore the downsampling layers use the stronger formulation:
-        S(x) = 1/4 * sum_k R_-k Conv(R_k x).
-
-    This is the only intentionally more expensive C4 convolution path. It is
-    used only in Stem/PatchEmbed, which preserves strong 0/90/180/270 behavior
-    without adding parameters.
-    """
+    """Rotation-averaged convolution for strided spatial operators."""
 
     def __init__(self, *args, group_average: bool = True, **kwargs):
         super().__init__(*args, **kwargs)
@@ -107,12 +87,7 @@ class C4FeatureSymConv2d(nn.Conv2d):
 def make_conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0,
                 dilation=1, groups=1, bias=True, padding_mode='zeros',
                 c4: bool = True, c4_downsample: bool = True):
-    """Create a spatial convolution for the DC4Former backbone.
-
-    - 1x1 conv: ordinary Conv2d.
-    - k>1, stride=1: C4 weight symmetrization, no extra parameters, one conv.
-    - k>1, stride>1: C4 feature-rotation downsampling when c4_downsample=True.
-    """
+    """Create an ordinary or C4-symmetric spatial convolution."""
     kernel_size_pair = to_2tuple(kernel_size)
     stride_pair = to_2tuple(stride)
 
@@ -134,11 +109,8 @@ def make_conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0,
     )
 
 
-# ==========================================================
-# DC4Former components
-# ==========================================================
 class IRB(nn.Module):
-    """DC4Former IRB with C4-symmetrized depthwise spatial convolution."""
+    """Inverted residual block with a symmetric depthwise convolution."""
 
     def __init__(self, in_features, hidden_features=None, out_features=None,
                  ksize=3, act_layer=nn.GELU, extra_act=False, drop=0.,
@@ -169,20 +141,7 @@ class IRB(nn.Module):
 
 
 class PoolingAttention(nn.Module):
-    """Strong-C4 pooling attention with constrained lightweight ESAF.
-
-    This is the TGRS-oriented version:
-    1) Four rot90 branches are still computed to preserve the Strong-C4 basis.
-    2) Uniform mean fusion remains the dominant path.
-    3) A lightweight spatial scorer can only add a bounded residual correction:
-           W_i = (1 - alpha) / 4 + alpha * softmax(S_i / tau)
-       where alpha is learnable but capped by ``fusion_alpha_max``.
-
-    Compared with free ESAF, this avoids blind branch over-confidence under
-    out-of-group angles while restoring some spatial/detail adaptivity over pure
-    mean fusion. The scorer is zero-initialized, so the initial forward is
-    exactly equivalent to C4 mean fusion.
-    """
+    """Pooling attention with four aligned rotation branches."""
 
     def __init__(self, dim, num_heads=2, qkv_bias=False, qk_scale=None,
                  attn_drop=0., proj_drop=0., pooled_sizes=(11, 8, 6, 4),
@@ -209,7 +168,6 @@ class PoolingAttention(nn.Module):
         self.q_pooled_size = q_pooled_size
         self.c4_attention = c4_attention
 
-        # 'mean' is the strict C4 ablation. 'cl_esaf' is the proposed version.
         self.fusion_type = str(fusion_type).lower()
         self.fusion_alpha_max = float(fusion_alpha_max)
         if self.fusion_type not in ('mean', 'cl_esaf', 'constrained_esaf'):
@@ -222,8 +180,6 @@ class PoolingAttention(nn.Module):
                 nn.GELU(),
                 nn.Conv2d(hidden, 1, kernel_size=1, bias=True)
             )
-            # Starts from uniform adaptive weights; therefore the whole module
-            # starts exactly as mean fusion.
             nn.init.constant_(self.fusion_scorer[-1].weight, 0.0)
             nn.init.constant_(self.fusion_scorer[-1].bias, 0.0)
             self.fusion_log_temp = nn.Parameter(torch.tensor(float(fusion_temp_init)))
@@ -294,22 +250,17 @@ class PoolingAttention(nn.Module):
         return out, Hq, Wq
 
     def _fuse_c4_branches(self, out_branches):
-        """Fuse aligned C4 branches.
-
-        out_branches: list of four tensors [B, C, Hq, Wq].
-        """
-        stacked = torch.stack(out_branches, dim=1)  # [B, 4, C, Hq, Wq]
+        """Fuse the four spatially aligned branches."""
+        stacked = torch.stack(out_branches, dim=1)
 
         if self.fusion_type == 'mean':
             return stacked.mean(dim=1)
 
         score_list = [self.fusion_scorer(branch) for branch in out_branches]
-        logits = torch.cat(score_list, dim=1)  # [B, 4, Hq, Wq]
+        logits = torch.cat(score_list, dim=1)
         temperature = F.softplus(self.fusion_log_temp) + 1e-6
         adaptive_w = F.softmax(logits / temperature, dim=1)
 
-        # Bounded adaptive correction. Even when the scorer becomes confident,
-        # it cannot fully override the stable mean-fusion path.
         alpha = self.fusion_alpha_max * torch.sigmoid(self.fusion_alpha_logit)
         weights = (1.0 - alpha) * 0.25 + alpha * adaptive_w
         return (stacked * weights.unsqueeze(2)).sum(dim=1)
@@ -415,7 +366,7 @@ class Block(nn.Module):
 
 
 class PatchEmbed(nn.Module):
-    """Overlapped image-to-patch embedding with optional strong C4 downsampling."""
+    """Overlapped image-to-patch embedding."""
 
     def __init__(self, img_size=224, patch_size=16, kernel_size=3,
                  in_chans=3, embed_dim=768, overlap=True,
@@ -452,7 +403,7 @@ class PatchEmbed(nn.Module):
 
 
 class Stem(nn.Module):
-    """DC4Former stem with optional strong C4 downsampling."""
+    """Convolutional stem with optional C4 downsampling."""
 
     def __init__(self, in_chans=3, out_chans=64, patch_size=4,
                  c4_conv=True, c4_downsample=True):
@@ -485,19 +436,7 @@ class Stem(nn.Module):
 
 @BACKBONES.register_module(force=True)
 class DC4Former(BaseModule):
-    """DC4Former backbone with C4-consistent spatial processing.
-
-    Based on the original lightweight backbone, this paper-oriented version keeps
-    only three C4 components:
-      1. C4 weight symmetrization for stride-1 spatial operators.
-      2. C4 feature-rotation averaging for strided downsampling operators.
-      3. C4 multi-view pooling attention with constrained lightweight ESAF.
-
-    The attention fusion keeps mean aggregation as the dominant path and only
-    allows a bounded spatially adaptive residual correction. It deliberately removes high-resolution fusion, adaptive orientation scorer,
-    detail residuals, variance modulation, q-max pooling, and anti-alias switches
-    to avoid engineering-style accumulation of tricks.
-    """
+    """Backbone with C4-symmetric convolutions and pooling attention."""
 
     def __init__(self, img_size=224, patch_size=4, in_chans=3,
                  num_classes=1000, embed_dims=(64, 128, 320, 512),
@@ -547,9 +486,6 @@ class DC4Former(BaseModule):
             c4_downsample=c4_downsample
         )
 
-        # Keep DC4Former's stage-level d_convs ordinary. They are already inside
-        # the outer C4 attention branches, so nested C4 would add cost without a
-        # clean paper contribution.
         self.d_convs1 = nn.ModuleList([
             nn.Conv2d(embed_dims[0], embed_dims[0], 3, 1, 1, groups=embed_dims[0])
             for _ in pooled_sizes[0]
@@ -743,7 +679,6 @@ class DC4Former(BaseModule):
         return self.forward_features(x)
 
 
-# Keep the legacy registry name available for existing experiment configs.
 BACKBONES.register_module(name='LRFormer', module=DC4Former, force=True)
 LRFormer = DC4Former
 

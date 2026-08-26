@@ -28,7 +28,7 @@ model = dict(
         init_cfg=dict(type='Pretrained', checkpoint='torchvision://resnet50')),
     decode_head=dict(
         type='SegformerHead',
-        in_channels=[64, 128, 320, 512],  # 这是你 LRFormer 的输出通道
+        in_channels=[64, 128, 320, 512],
         in_index=[0, 1, 2, 3],
         channels=256,
         dropout_ratio=0.1,
@@ -40,14 +40,11 @@ model = dict(
             type='CrossEntropyLoss',
             use_sigmoid=False,
             loss_weight=1.0,
-            # class_weight=[...]  <-- 后续加极端类别权重的位置
         )
     ),
-    # 清空复杂的 assigner 和 sampler，保持轻量高效
     train_cfg=dict(),
     test_cfg=dict(mode='whole'))
 
-# dataset config
 train_pipeline = [
     dict(type='LoadImageFromFile'),
     dict(type='LoadAnnotations', reduce_zero_label=False),
@@ -70,7 +67,6 @@ train_pipeline = [
 ]
 train_dataloader = dict(batch_size=17, dataset=dict(pipeline=train_pipeline))
 
-# optimizer
 optimizer = dict(
     type='AdamW', lr=0.0002, weight_decay=0.05, eps=1e-8, betas=(0.9, 0.999))
 optim_wrapper = dict(
@@ -83,7 +79,6 @@ optim_wrapper = dict(
         },
         norm_decay_mult=0.0))
 
-# learning policy
 param_scheduler = [
     dict(
         type='PolyLR',

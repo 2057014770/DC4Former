@@ -1,17 +1,3 @@
-# Copyright (c) OpenMMLab. All rights reserved.
-# Unified rotation-wise mIoU evaluation script.
-# The evaluation path is kept consistent across configured datasets:
-#   1) fixed-canvas rotation by default (auto_bound=False)
-#   2) update ori_shape/img_shape/pad_shape consistently
-#   3) rotate every segmentation field
-#   4) reset scale_factor after the evaluation rotation
-#   5) accumulate the confusion matrix image by image
-#   6) raise an error on prediction/GT shape mismatch by default
-#   7) print per-angle per-class IoU and foreground-mIoU summaries
-#
-# Default angles:
-#   0,45,90,135,180,225,270,315
-
 import argparse
 import copy
 import csv
@@ -315,7 +301,6 @@ def infer_class_names(cfg, num_classes, arg_class_names=None):
 
 
 def build_rotation_cfg(args, angle):
-    # Apply one consistent protocol to every configured dataset.
     return dict(
         type='RotationEvalTransform',
         angle=float(angle),
